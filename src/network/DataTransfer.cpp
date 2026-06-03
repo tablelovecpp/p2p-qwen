@@ -208,18 +208,51 @@ void DataTransfer::startSendTransfer(ActiveTransfer* transfer)
     }
 
     LOG_INFO(QString("Sent metadata for file: %1").arg(transfer->info.fileName));
+
+    // 发送元数据后，开始发送第一个 chunk
+    if (transfer->currentChunk < transfer->totalChunks) {
+        QByteArray chunk = transfer->chunks[transfer->currentChunk];
+
+        QByteArray chunkPacket;
+        QDataStream stream(&chunkPacket, QIODevice::WriteOnly);
+        stream << transfer->currentChunk << transfer->totalChunks;
+        chunkPacket.append(chunk);
+
+        if (transfer->connection->sendData(chunkPacket)) {
+            transfer->currentChunk++;
+            transfer->info.progress = (static_cast<double>(transfer->currentChunk) /
+                                       transfer->totalChunks) * 100.0;
+            transfer->info.status = QString("Sending: %1%").arg(transfer->info.progress, 0, 'f', 1);
+
+            emit transferProgress(transfer->info.transferId, transfer->info.progress);
+
+            LOG_DEBUG(QString("Sent initial chunk %1/%2")
+                          .arg(transfer->currentChunk).arg(transfer->totalChunks));
+        } else {
+            LOG_ERROR("Failed to send first chunk");
+            emit transferFailed(transfer->info.transferId, "Failed to send first chunk");
+        }
+    }
 }
 
 void DataTransfer::processReceivedChunk(ActiveTransfer* transfer, const QByteArray& data)
 {
     if (!transfer) return;
 
-    if (data.size() < 8) return;
+    if (data.size() < 8) {
+        LOG_WARNING("Received chunk data too small");
+        return;
+    }
 
     QDataStream stream(data);
     int chunkIndex;
     int totalChunks;
     stream >> chunkIndex >> totalChunks;
+
+    if (chunkIndex < 0 || chunkIndex >= totalChunks) {
+        LOG_ERROR(QString("Invalid chunk index: %1/%2").arg(chunkIndex).arg(totalChunks));
+        return;
+    }
 
     QByteArray chunkData = data.mid(8);
 
@@ -236,6 +269,17 @@ void DataTransfer::processReceivedChunk(ActiveTransfer* transfer, const QByteArr
 
     LOG_DEBUG(QString("Received chunk %1/%2, progress: %3%")
                   .arg(chunkIndex + 1).arg(totalChunks).arg(progress, 0, 'f', 1));
+
+    // 发送确认给发送方
+    QJsonObject ack;
+    ack["type"] = "chunk_received";
+    ack["chunkIndex"] = chunkIndex;
+    QJsonDocument doc(ack);
+    
+    if (transfer->connection) {
+        QByteArray ackData = doc.toJson(QJsonDocument::Compact);
+        transfer->connection->sendData(ackData);
+    }
 
     if (m_chunkManager.isFileComplete(transfer->info.fileId)) {
         finalizeReceive(transfer);
@@ -286,41 +330,73 @@ void DataTransfer::onConnectionDataReceived(const QByteArray& data)
         if (it.value()->connection == senderConn) {
             ActiveTransfer* transfer = it.value();
 
-            if (!data.isEmpty() && data[0] == 0x02) {
+            // 检查是否是元数据（以 0x02 开头）
+            if (!data.isEmpty() && static_cast<unsigned char>(data[0]) == 0x02) {
+                // 这是元数据，解析并准备接收
+                QByteArray metadataBytes = data.mid(1);
+                QJsonParseError parseError;
+                QJsonDocument doc = QJsonDocument::fromJson(metadataBytes, &parseError);
+
+                if (parseError.error == QJsonParseError::NoError) {
+                    QJsonObject metadata = doc.object();
+                    QString type = metadata["type"].toString();
+
+                    if (type == "file_transfer") {
+                        // 发送方：元数据已发送，等待接收方准备好后开始发送 chunks
+                        // 接收方：已经通过 prepareReceive 准备好了
+                        LOG_INFO("Metadata exchange completed");
+                    }
+                }
                 continue;
             }
 
-            if (transfer->info.isSending) {
-                if (transfer->currentChunk < transfer->totalChunks) {
-                    QByteArray chunk = transfer->chunks[transfer->currentChunk];
+            // 尝试解析为 JSON 消息（确认消息等）
+            QJsonParseError jsonError;
+            QJsonDocument jsonDoc = QJsonDocument::fromJson(data, &jsonError);
+            if (jsonError.error == QJsonParseError::NoError) {
+                QJsonObject jsonObj = jsonDoc.object();
+                QString msgType = jsonObj["type"].toString();
 
-                    QByteArray packet;
-                    QDataStream stream(&packet, QIODevice::WriteOnly);
-                    stream << transfer->currentChunk << transfer->totalChunks;
-                    packet.append(chunk);
+                if (msgType == "chunk_received" && transfer->info.isSending) {
+                    // 发送方收到 chunk 确认，继续发送下一个 chunk
+                    int ackChunkIndex = jsonObj["chunkIndex"].toInt();
+                    LOG_DEBUG(QString("Chunk %1 acknowledged").arg(ackChunkIndex));
 
-                    if (transfer->connection->sendData(packet)) {
-                        transfer->currentChunk++;
-                        transfer->info.progress = (static_cast<double>(transfer->currentChunk) /
-                                                   transfer->totalChunks) * 100.0;
-                        transfer->info.status = QString("Sending: %1%").arg(transfer->info.progress, 0, 'f', 1);
+                    if (transfer->currentChunk < transfer->totalChunks) {
+                        QByteArray chunk = transfer->chunks[transfer->currentChunk];
 
-                        emit transferProgress(transfer->info.transferId, transfer->info.progress);
+                        QByteArray packet;
+                        QDataStream stream(&packet, QIODevice::WriteOnly);
+                        stream << transfer->currentChunk << transfer->totalChunks;
+                        packet.append(chunk);
 
-                        LOG_DEBUG(QString("Sent chunk %1/%2")
-                                      .arg(transfer->currentChunk).arg(transfer->totalChunks));
+                        if (transfer->connection->sendData(packet)) {
+                            transfer->currentChunk++;
+                            transfer->info.progress = (static_cast<double>(transfer->currentChunk) /
+                                                       transfer->totalChunks) * 100.0;
+                            transfer->info.status = QString("Sending: %1%").arg(transfer->info.progress, 0, 'f', 1);
+
+                            emit transferProgress(transfer->info.transferId, transfer->info.progress);
+
+                            LOG_DEBUG(QString("Sent chunk %1/%2")
+                                          .arg(transfer->currentChunk).arg(transfer->totalChunks));
+                        }
+
+                        if (transfer->currentChunk >= transfer->totalChunks) {
+                            transfer->info.isCompleted = true;
+                            transfer->info.progress = 100.0;
+                            transfer->info.status = "Completed";
+
+                            LOG_INFO(QString("File sent successfully: %1").arg(transfer->info.fileName));
+                            emit transferCompleted(transfer->info.transferId, transfer->info.fileName);
+                        }
                     }
-
-                    if (transfer->currentChunk >= transfer->totalChunks) {
-                        transfer->info.isCompleted = true;
-                        transfer->info.progress = 100.0;
-                        transfer->info.status = "Completed";
-
-                        LOG_INFO(QString("File sent successfully: %1").arg(transfer->info.fileName));
-                        emit transferCompleted(transfer->info.transferId, transfer->info.fileName);
-                    }
+                    continue;
                 }
-            } else {
+            }
+
+            // 处理普通数据包（chunks）- 仅接收方
+            if (!transfer->info.isSending) {
                 processReceivedChunk(transfer, data);
             }
 

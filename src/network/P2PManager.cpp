@@ -275,6 +275,12 @@ void P2PManager::handleIncomingMessage(TCPConnection* connection, const QByteArr
         m_dataTransfer->prepareReceive(fileId, fileName, fileSize);
 
         LOG_INFO(QString("Received file transfer request: %1 (%2 bytes)").arg(fileName).arg(fileSize));
+
+    } else if (messageType == "chunk_received") {
+        // 接收方收到 chunk 后发送确认
+        // 发送方收到确认后继续发送下一个 chunk（在 DataTransfer 中处理）
+        int chunkIndex = json["chunkIndex"].toInt();
+        LOG_DEBUG(QString("Chunk %1 acknowledged").arg(chunkIndex));
     }
 }
 
