@@ -1,6 +1,0 @@
-<RCC>
-  <qresource prefix="/">
-    <file alias="/qt/qml/p2p_qt">D:/qwen-projects/p2p_qt/build/Desktop_Qt_6_11_1_MinGW_64_bit-Release/p2p_qt</file>
-
-  </qresource>
-</RCC>
