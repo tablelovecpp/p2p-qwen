@@ -342,9 +342,25 @@ void DataTransfer::onConnectionDataReceived(const QByteArray& data)
                     QString type = metadata["type"].toString();
 
                     if (type == "file_transfer") {
-                        // 发送方：元数据已发送，等待接收方准备好后开始发送 chunks
-                        // 接收方：已经通过 prepareReceive 准备好了
-                        LOG_INFO("Metadata exchange completed");
+                        // 接收方：收到元数据后，准备接收文件
+                        QUuid fileId = QUuid::fromString(metadata["fileId"].toString());
+                        QString fileName = metadata["fileName"].toString();
+                        qint64 fileSize = metadata["fileSize"].toInteger();
+                        int totalChunks = metadata["totalChunks"].toInt();
+
+                        // 更新 transfer 信息
+                        transfer->info.fileId = fileId;
+                        transfer->info.fileName = fileName;
+                        transfer->info.fileSize = fileSize;
+                        transfer->totalChunks = totalChunks;
+                        transfer->info.isSending = false;
+                        transfer->info.status = "Receiving";
+
+                        // 设置保存路径
+                        transfer->savePath = transfer->fileHandler.createTempFilePath(fileName);
+
+                        LOG_INFO(QString("Preparing to receive file: %1 (%2 bytes, %3 chunks)")
+                                     .arg(fileName).arg(fileSize).arg(totalChunks));
                     }
                 }
                 continue;
@@ -396,8 +412,14 @@ void DataTransfer::onConnectionDataReceived(const QByteArray& data)
             }
 
             // 处理普通数据包（chunks）- 仅接收方
+            // 注意：chunk 数据包含 chunkIndex(4 字节) + totalChunks(4 字节) + data
             if (!transfer->info.isSending) {
-                processReceivedChunk(transfer, data);
+                // 验证数据长度至少包含 chunk 头
+                if (data.size() >= 8) {
+                    processReceivedChunk(transfer, data);
+                } else {
+                    LOG_WARNING(QString("Received invalid chunk data, size: %1").arg(data.size()));
+                }
             }
 
             break;

@@ -267,7 +267,7 @@ void P2PManager::handleIncomingMessage(TCPConnection* connection, const QByteArr
         }
 
     } else if (messageType == "file_transfer_request") {
-        // 文件传输请求
+        // 文件传输请求 - 这个逻辑已废弃，现在使用元数据方式
         QUuid fileId = QUuid::fromString(json["fileId"].toString());
         QString fileName = json["fileName"].toString();
         qint64 fileSize = json["fileSize"].toInteger();
@@ -281,6 +281,9 @@ void P2PManager::handleIncomingMessage(TCPConnection* connection, const QByteArr
         // 发送方收到确认后继续发送下一个 chunk（在 DataTransfer 中处理）
         int chunkIndex = json["chunkIndex"].toInt();
         LOG_DEBUG(QString("Chunk %1 acknowledged").arg(chunkIndex));
+    } else if (messageType == "hello_response") {
+        // 握手响应，不需要特殊处理
+        LOG_DEBUG("Received hello response");
     }
 }
 
