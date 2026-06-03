@@ -1,0 +1,6 @@
+module p2p_qt
+typeinfo appp2p_qt.qmltypes
+prefer :/qt/qml/p2p_qt/
+Main 254.0 Main.qml
+depends QtQuick
+

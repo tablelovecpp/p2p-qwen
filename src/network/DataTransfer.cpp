@@ -1,0 +1,376 @@
+#include "DataTransfer.h"
+#include "../utils/Logger.h"
+#include "../utils/Config.h"
+#include <QFile>
+#include <QDataStream>
+#include <QJsonDocument>   // [FIX] Qt6 必须显式包含
+#include <QJsonObject>     // [FIX] Qt6 必须显式包含
+#include <QDir>            // [FIX] Qt6 必须显式包含
+
+// [FIX] 使用初始化列表初始化 m_chunkManager，避免拷贝赋值
+DataTransfer::DataTransfer(QObject* parent)
+    : QObject(parent)
+    , m_chunkManager(Config::instance().getChunkSize())  // 正确初始化方式
+{
+    m_threadPool.setMaxThreadCount(Config::instance().getMaxThreads());
+    LOG_INFO("DataTransfer initialized");
+}
+
+DataTransfer::~DataTransfer()
+{
+    QMutexLocker locker(&m_mutex);
+
+    for (auto it = m_activeTransfers.begin(); it != m_activeTransfers.end(); ++it) {
+        if (it.value()->connection) {
+            it.value()->connection->disconnect();
+            delete it.value()->connection;
+        }
+        delete it.value();
+    }
+    m_activeTransfers.clear();
+}
+
+QUuid DataTransfer::sendFile(const QString& filePath, const QString& remoteHost, quint16 remotePort)
+{
+    FileHandler fileHandler;
+
+    if (!fileHandler.fileExists(filePath)) {
+        LOG_ERROR(QString("File not found: %1").arg(filePath));
+        emit transferFailed(QUuid(), "File not found");
+        return QUuid();
+    }
+
+    FileInfo fileInfo = fileHandler.getFileInfo(filePath);
+    if (fileInfo.fileSize == 0) {
+        LOG_ERROR("Empty file");
+        emit transferFailed(QUuid(), "Empty file");
+        return QUuid();
+    }
+
+    QByteArray fileData = fileHandler.readFile(filePath);
+    if (fileData.isEmpty()) {
+        LOG_ERROR("Failed to read file");
+        emit transferFailed(QUuid(), "Failed to read file");
+        return QUuid();
+    }
+
+    QVector<QByteArray> chunks = m_chunkManager.splitData(fileData);
+
+    // [FIX] 现在 ActiveTransfer 定义完整，可以正常访问所有成员
+    ActiveTransfer* transfer = new ActiveTransfer();
+    transfer->info.transferId = QUuid::createUuid();
+    transfer->info.fileId = fileInfo.id;
+    transfer->info.fileName = fileInfo.fileName;
+    transfer->info.fileSize = fileInfo.fileSize;
+    transfer->info.remoteAddress = remoteHost;
+    transfer->info.remotePort = remotePort;
+    transfer->info.progress = 0;
+    transfer->info.isSending = true;
+    transfer->info.isCompleted = false;
+    transfer->info.status = "Initializing";
+    transfer->currentChunk = 0;
+    transfer->totalChunks = chunks.size();
+    transfer->chunks = chunks;
+
+    TCPConnection* connection = new TCPConnection();
+    transfer->connection = connection;
+
+    connect(connection, &TCPConnection::dataReceived,
+            this, &DataTransfer::onConnectionDataReceived);
+    connect(connection, &TCPConnection::connected,
+            this, &DataTransfer::onConnectionConnected);
+    connect(connection, &TCPConnection::disconnected,
+            this, &DataTransfer::onConnectionDisconnected);
+    connect(connection, &TCPConnection::errorOccurred,
+            this, &DataTransfer::onConnectionError);
+
+    {
+        QMutexLocker locker(&m_mutex);
+        m_activeTransfers[transfer->info.transferId] = transfer;
+    }
+
+    LOG_INFO(QString("Starting file transfer: %1 to %2:%3")
+                 .arg(filePath).arg(remoteHost).arg(remotePort));
+
+    connection->connectToHost(remoteHost, remotePort);
+
+    emit transferStarted(transfer->info.transferId);
+    return transfer->info.transferId;
+}
+
+void DataTransfer::prepareReceive(const QUuid& fileId, const QString& fileName, qint64 fileSize)
+{
+    ActiveTransfer* transfer = new ActiveTransfer();
+    transfer->info.transferId = QUuid::createUuid();
+    transfer->info.fileId = fileId;
+    transfer->info.fileName = fileName;
+    transfer->info.fileSize = fileSize;
+    transfer->info.progress = 0;
+    transfer->info.isSending = false;
+    transfer->info.isCompleted = false;
+    transfer->info.status = "Waiting for data";
+    transfer->currentChunk = 0;
+    transfer->totalChunks = 0;
+    transfer->connection = nullptr;
+
+    transfer->savePath = transfer->fileHandler.createTempFilePath(fileName);
+
+    {
+        QMutexLocker locker(&m_mutex);
+        m_activeTransfers[transfer->info.transferId] = transfer;
+    }
+
+    LOG_INFO(QString("Prepared to receive file: %1, size: %2 bytes").arg(fileName).arg(fileSize));
+}
+
+void DataTransfer::cancelTransfer(const QUuid& transferId)
+{
+    QMutexLocker locker(&m_mutex);
+
+    if (!m_activeTransfers.contains(transferId)) {
+        return;
+    }
+
+    ActiveTransfer* transfer = m_activeTransfers[transferId];
+
+    if (transfer->connection) {
+        transfer->connection->disconnect();
+        delete transfer->connection;
+        transfer->connection = nullptr;
+    }
+
+    transfer->info.status = "Cancelled";
+    emit transferCancelled(transferId);
+
+    m_activeTransfers.remove(transferId);
+    delete transfer;
+
+    LOG_INFO(QString("Transfer cancelled: %1").arg(transferId.toString()));
+}
+
+TransferInfo DataTransfer::getTransferInfo(const QUuid& transferId) const
+{
+    QMutexLocker locker(&m_mutex);
+
+    if (m_activeTransfers.contains(transferId)) {
+        return m_activeTransfers[transferId]->info;
+    }
+
+    return TransferInfo();
+}
+
+QList<TransferInfo> DataTransfer::getAllTransfers() const
+{
+    QMutexLocker locker(&m_mutex);
+
+    QList<TransferInfo> transfers;
+    for (auto it = m_activeTransfers.begin(); it != m_activeTransfers.end(); ++it) {
+        transfers.append(it.value()->info);
+    }
+
+    return transfers;
+}
+
+void DataTransfer::setEncryption(const QString& key)
+{
+    QMutexLocker locker(&m_mutex);
+
+    for (auto it = m_activeTransfers.begin(); it != m_activeTransfers.end(); ++it) {
+        it.value()->encryption.setEnabled(!key.isEmpty());
+    }
+}
+
+void DataTransfer::startSendTransfer(ActiveTransfer* transfer)
+{
+    if (!transfer || !transfer->connection) return;
+
+    transfer->info.status = "Sending";
+
+    QJsonObject metadata;
+    metadata["type"] = "file_transfer";
+    metadata["fileId"] = transfer->info.fileId.toString();
+    metadata["fileName"] = transfer->info.fileName;
+    metadata["fileSize"] = transfer->info.fileSize;
+    metadata["totalChunks"] = transfer->totalChunks;
+    metadata["chunkSize"] = Config::instance().getChunkSize();
+
+    QJsonDocument doc(metadata);
+    QByteArray metadataBytes = doc.toJson(QJsonDocument::Compact);
+
+    QByteArray packet;
+    packet.append(static_cast<char>(0x02));
+    packet.append(metadataBytes);
+
+    if (!transfer->connection->sendData(packet)) {
+        LOG_ERROR("Failed to send metadata");
+        emit transferFailed(transfer->info.transferId, "Failed to send metadata");
+        return;
+    }
+
+    LOG_INFO(QString("Sent metadata for file: %1").arg(transfer->info.fileName));
+}
+
+void DataTransfer::processReceivedChunk(ActiveTransfer* transfer, const QByteArray& data)
+{
+    if (!transfer) return;
+
+    if (data.size() < 8) return;
+
+    QDataStream stream(data);
+    int chunkIndex;
+    int totalChunks;
+    stream >> chunkIndex >> totalChunks;
+
+    QByteArray chunkData = data.mid(8);
+
+    m_chunkManager.addChunk(transfer->info.fileId, chunkIndex, totalChunks, chunkData);
+
+    transfer->currentChunk = chunkIndex + 1;
+    transfer->totalChunks = totalChunks;
+
+    double progress = m_chunkManager.getProgress(transfer->info.fileId);
+    transfer->info.progress = progress;
+    transfer->info.status = QString("Receiving: %1%").arg(progress, 0, 'f', 1);
+
+    emit transferProgress(transfer->info.transferId, progress);
+
+    LOG_DEBUG(QString("Received chunk %1/%2, progress: %3%")
+                  .arg(chunkIndex + 1).arg(totalChunks).arg(progress, 0, 'f', 1));
+
+    if (m_chunkManager.isFileComplete(transfer->info.fileId)) {
+        finalizeReceive(transfer);
+    }
+}
+
+void DataTransfer::finalizeReceive(ActiveTransfer* transfer)
+{
+    if (!transfer) return;
+
+    transfer->info.status = "Finalizing";
+
+    QByteArray fileData = m_chunkManager.reassembleFile(transfer->info.fileId);
+
+    if (fileData.isEmpty()) {
+        LOG_ERROR("Failed to reassemble file");
+        emit transferFailed(transfer->info.transferId, "Failed to reassemble file");
+        return;
+    }
+
+    QString finalPath = QDir::homePath() + "/Downloads/" + transfer->info.fileName;
+
+    if (transfer->fileHandler.writeFile(finalPath, fileData)) {
+        transfer->info.isCompleted = true;
+        transfer->info.progress = 100.0;
+        transfer->info.status = "Completed";
+
+        LOG_INFO(QString("File received and saved: %1").arg(finalPath));
+        emit transferCompleted(transfer->info.transferId, finalPath);
+    } else {
+        LOG_ERROR("Failed to save received file");
+        emit transferFailed(transfer->info.transferId, "Failed to save file");
+    }
+
+    m_chunkManager.removeFile(transfer->info.fileId);
+}
+
+void DataTransfer::onConnectionDataReceived(const QByteArray& data)
+{
+    if (data.isEmpty()) return;
+
+    QMutexLocker locker(&m_mutex);
+
+    TCPConnection* senderConn = qobject_cast<TCPConnection*>(sender());
+    if (!senderConn) return;
+
+    for (auto it = m_activeTransfers.begin(); it != m_activeTransfers.end(); ++it) {
+        if (it.value()->connection == senderConn) {
+            ActiveTransfer* transfer = it.value();
+
+            if (!data.isEmpty() && data[0] == 0x02) {
+                continue;
+            }
+
+            if (transfer->info.isSending) {
+                if (transfer->currentChunk < transfer->totalChunks) {
+                    QByteArray chunk = transfer->chunks[transfer->currentChunk];
+
+                    QByteArray packet;
+                    QDataStream stream(&packet, QIODevice::WriteOnly);
+                    stream << transfer->currentChunk << transfer->totalChunks;
+                    packet.append(chunk);
+
+                    if (transfer->connection->sendData(packet)) {
+                        transfer->currentChunk++;
+                        transfer->info.progress = (static_cast<double>(transfer->currentChunk) /
+                                                   transfer->totalChunks) * 100.0;
+                        transfer->info.status = QString("Sending: %1%").arg(transfer->info.progress, 0, 'f', 1);
+
+                        emit transferProgress(transfer->info.transferId, transfer->info.progress);
+
+                        LOG_DEBUG(QString("Sent chunk %1/%2")
+                                      .arg(transfer->currentChunk).arg(transfer->totalChunks));
+                    }
+
+                    if (transfer->currentChunk >= transfer->totalChunks) {
+                        transfer->info.isCompleted = true;
+                        transfer->info.progress = 100.0;
+                        transfer->info.status = "Completed";
+
+                        LOG_INFO(QString("File sent successfully: %1").arg(transfer->info.fileName));
+                        emit transferCompleted(transfer->info.transferId, transfer->info.fileName);
+                    }
+                }
+            } else {
+                processReceivedChunk(transfer, data);
+            }
+
+            break;
+        }
+    }
+}
+
+void DataTransfer::onConnectionConnected()
+{
+    TCPConnection* connection = qobject_cast<TCPConnection*>(sender());
+    if (!connection) return;
+
+    QMutexLocker locker(&m_mutex);
+
+    for (auto it = m_activeTransfers.begin(); it != m_activeTransfers.end(); ++it) {
+        if (it.value()->connection == connection) {
+            ActiveTransfer* transfer = it.value();
+
+            if (transfer->info.isSending) {
+                startSendTransfer(transfer);
+            }
+
+            break;
+        }
+    }
+}
+
+void DataTransfer::onConnectionDisconnected()
+{
+    TCPConnection* connection = qobject_cast<TCPConnection*>(sender());
+    if (!connection) return;
+
+    LOG_WARNING("Connection disconnected during transfer");
+}
+
+void DataTransfer::onConnectionError(const QString& error)
+{
+    TCPConnection* connection = qobject_cast<TCPConnection*>(sender());
+    if (!connection) return;
+
+    QMutexLocker locker(&m_mutex);
+
+    for (auto it = m_activeTransfers.begin(); it != m_activeTransfers.end(); ++it) {
+        if (it.value()->connection == connection) {
+            ActiveTransfer* transfer = it.value();
+            transfer->info.status = "Error: " + error;
+
+            emit transferFailed(transfer->info.transferId, error);
+            break;
+        }
+    }
+}

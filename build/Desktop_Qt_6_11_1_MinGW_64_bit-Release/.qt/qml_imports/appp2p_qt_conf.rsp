@@ -1,0 +1,14 @@
+-rootPath
+D:/qwen-projects/p2p_qt
+-cmake-output
+-output-file
+D:/qwen-projects/p2p_qt/build/Desktop_Qt_6_11_1_MinGW_64_bit-Release/.qt/qml_imports/appp2p_qt_conf.cmake
+-importPath
+D:/qwen-projects/p2p_qt/build/Desktop_Qt_6_11_1_MinGW_64_bit-Release
+-importPath
+D:/qwen-projects/p2p_qt/build/Desktop_Qt_6_11_1_MinGW_64_bit-Release/p2p_qt
+-importPath
+D:/Qt/6.11.1/mingw_64/qml
+-qrcFiles
+D:/qwen-projects/p2p_qt/build/Desktop_Qt_6_11_1_MinGW_64_bit-Release/.qt/rcc/qmake_p2p_qt.qrc
+D:/qwen-projects/p2p_qt/build/Desktop_Qt_6_11_1_MinGW_64_bit-Release/.qt/rcc/appp2p_qt_raw_qml_0.qrc
