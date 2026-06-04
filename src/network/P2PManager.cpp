@@ -140,8 +140,13 @@ QUuid P2PManager::sendFile(const QString& filePath, const QString& peerId)
     }
 
     TCPConnection* connection = m_peerConnections[peerId];
+    // 使用信令连接的同一地址，但使用专门的传输端口
     QString address = connection->getPeerAddress();
-    quint16 port = connection->getPeerPort();
+    // 移除 IPv6 映射前缀 ::ffff: 如果存在
+    if (address.startsWith("::ffff:")) {
+        address = address.mid(7);
+    }
+    quint16 port = m_tcpPort;  // 使用与信令相同的 TCP 端口进行文件传输
 
     QUuid transferId = m_dataTransfer->sendFile(filePath, address, port);
 
