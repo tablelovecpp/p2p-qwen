@@ -140,8 +140,14 @@ QUuid P2PManager::sendFile(const QString& filePath, const QString& peerId)
     }
 
     TCPConnection* connection = m_peerConnections[peerId];
+    // 使用信令连接的地址，但使用固定的监听端口进行文件传输
     QString address = connection->getPeerAddress();
-    quint16 port = connection->getPeerPort();
+    // 移除 IPv6 映射前缀 ::ffff: 如果存在
+    if (address.startsWith("::ffff:")) {
+        address = address.mid(7);
+    }
+    // 使用本地监听的 TCP 端口（对等方也在这个端口监听）
+    quint16 port = m_tcpPort;
 
     QUuid transferId = m_dataTransfer->sendFile(filePath, address, port);
 
